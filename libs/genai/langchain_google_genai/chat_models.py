@@ -227,6 +227,28 @@ class ChatGoogleGenerativeAIError(GoogleGenerativeAIError):
     """
 
 
+# Starting with Gemini 3.6 Flash and Gemini 3.5 Flash-Lite, Google deprecated
+# custom sampling parameters and disallows prefilling model turns. Per Google's
+# docs these rules apply to "these models and all future Gemini model releases",
+# but Gemini version numbers are not monotonic across variants (e.g. plain
+# `gemini-3.5-flash` is *not* affected while `gemini-3.5-flash-lite` is), so the
+# affected models are tracked by an explicit allowlist. Add future GA models here
+# as they ship.
+_FIXED_SAMPLING_AND_NO_PREFILL_MODELS = frozenset(
+    {"gemini-3.5-flash-lite", "gemini-3.6-flash"}
+)
+_CUSTOM_SAMPLING_PARAMETERS = ("temperature", "top_k", "top_p")
+
+
+def _uses_fixed_sampling_and_disallows_prefill(model_name: str) -> bool:
+    """Check whether a model uses fixed sampling and rejects model prefills."""
+    if not model_name:
+        return False
+    normalized_model = model_name.lower().rsplit("/", 1)[-1]
+    normalized_model = re.sub(r"-\d{3}$", "", normalized_model)
+    return normalized_model in _FIXED_SAMPLING_AND_NO_PREFILL_MODELS
+
+
 def _is_gemini_3_or_later(model_name: str) -> bool:
     """Checks if the model is Gemini 3 or later."""
     if not model_name:
@@ -3011,6 +3033,16 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
             convert_system_message_to_human=self.convert_system_message_to_human,
             model=self.model,
         )
+        if (
+            _uses_fixed_sampling_and_disallows_prefill(self.model)
+            and history
+            and history[-1].role == "model"
+        ):
+            msg = (
+                f"Model '{self.model}' does not support model prefilling. The final "
+                "request turn must be a user message or a function response."
+            )
+            raise ValueError(msg)
 
         # Process tool configuration
         formatted_tool_config = self._process_tool_config(
@@ -3272,6 +3304,28 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
         if image_config_dict is not None:
             image_config_obj = ImageConfig(**image_config_dict)
 
+        request_params = params.model_dump(exclude_unset=True)
+        if _uses_fixed_sampling_and_disallows_prefill(self.model):
+            # These models use fixed sampling defaults and ignore custom sampling
+            # parameters. Drop them from the request and warn so an explicitly-set
+            # value isn't silently discarded (consistent with how superseded
+            # thinking parameters are handled above).
+            ignored_parameters = [
+                parameter
+                for parameter in _CUSTOM_SAMPLING_PARAMETERS
+                if parameter in request_params
+            ]
+            if ignored_parameters:
+                warnings.warn(
+                    f"Model '{self.model}' uses fixed sampling defaults; the "
+                    f"sampling parameter(s) {', '.join(ignored_parameters)} "
+                    "will be ignored.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                for parameter in ignored_parameters:
+                    request_params.pop(parameter, None)
+
         return GenerateContentConfig(
             tools=list(formatted_tools) if formatted_tools else None,
             tool_config=formatted_tool_config,
@@ -3281,7 +3335,7 @@ class ChatGoogleGenerativeAI(_BaseGoogleGenerativeAI, BaseChatModel):
             http_options=http_options,
             image_config=image_config_obj,
             labels=labels,
-            **params.model_dump(exclude_unset=True),
+            **request_params,
             **kwargs,
         )
 
